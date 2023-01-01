@@ -10,28 +10,29 @@ import (
 	"io"
 )
 
-// headerLen is the length of a QOI header.
-const headerLen = 14
+// Start-of-chunk tag constant.
+const (
+	opIndex = 0b0000_0000
+	opDiff  = 0b0100_0000
+	opLuma  = 0b1000_0000
+	opRun   = 0b1100_0000
+	opRGB   = 0b1111_1110
+	opRGBA  = 0b1111_1111
 
-// magic is the QOI format magic signature.
+	// Mask for two-bit tags.
+	opMask2 = 0b1100_0000
+)
+
+func hash(c color.NRGBA) uint8 {
+	return c.R*3 + c.G*5 + c.B*7 + c.A*11
+}
+
 const magic = "qoif"
+
+const headerLen = 14
 
 // endMarker is the QOI end-of-stream marker.
 const endMarker = "\x00\x00\x00\x00\x00\x00\x00\x01"
-
-// Start-of-chunk tag.
-const (
-	tagRGB   = 0b1111_1110
-	tagRGBA  = 0b1111_1111
-	tagIndex = 0b00
-	tagDiff  = 0b01
-	tagLuma  = 0b10
-	tagRun   = 0b11
-)
-
-func hash(r, g, b, a uint8) uint8 {
-	return (r*3 + g*5 + b*7 + a*11) % 64
-}
 
 // A FormatError reports that the input is not a valid QOI image.
 type FormatError string
@@ -40,27 +41,14 @@ func (e FormatError) Error() string {
 	return "qoi: invalid format: " + string(e)
 }
 
-var chunkOrderError = FormatError("chunk out of order")
-
-// Decoding stage.
-const (
-	dsStart = iota
-	dsSeenHeader
-	dsSeenRGB
-	dsSeenRGBA
-	dsSeenIndex
-	dsSeenDiff
-	dsSeenLuma
-	dsSeenRun
-	dsSeenEndMarker
-)
-
 type decoder struct {
 	r             io.Reader
-	img           image.Image
+	img           *image.NRGBA
 	width, height int
-	stage         int
-	tmp           [1024]byte
+	tmp           [10]byte
+	run           int
+	index         [64]color.NRGBA
+	prev          color.NRGBA
 }
 
 func (d *decoder) parseHeader() error {
@@ -78,45 +66,86 @@ func (d *decoder) parseHeader() error {
 		return err
 	}
 
-	// TODO: Dimension overflow checks.
-
 	d.width = int(binary.BigEndian.Uint32(d.tmp[0:4]))
 	d.height = int(binary.BigEndian.Uint32(d.tmp[4:8]))
+
+	// TODO: Dimension overflow checks.
+
+	d.img = image.NewNRGBA(image.Rect(0, 0, d.width, d.height))
+
+	switch channels := d.tmp[8]; channels {
+	case 3, 4: // RGB, RGBA
+		// ok
+	default:
+		return FormatError("invalid channel count")
+	}
+
+	switch colorSpace := d.tmp[9]; colorSpace {
+	case 0, 1: // sRGB, linear
+		// ok
+	default:
+		return FormatError("invalid color space")
+	}
 
 	return nil
 }
 
-func (d *decoder) parseChunk() error {
-	if _, err := io.ReadFull(d.r, d.tmp[:1]); err != nil {
+func (d *decoder) advance() error {
+	if d.run > 0 {
+		d.run--
+		return nil
+	}
+
+	_, err := io.ReadFull(d.r, d.tmp[:1])
+	if err != nil {
 		return err
 	}
 
 	switch t := d.tmp[0]; {
-	case t == tagRGB:
-		if d.stage != dsStart {
-			return chunkOrderError
+	case t == opRGB:
+		_, err := io.ReadFull(d.r, d.tmp[1:4])
+		if err != nil {
+			return err
 		}
-		d.stage = dsSeenRGB
-	case t == tagRGBA:
-		return nil
-	case t>>6 == tagIndex:
-		return nil
-	case t>>6 == tagDiff:
-		return nil
-	case t>>6 == tagLuma:
-		return nil
-	case t>>6 == tagRun:
-		return nil
-	default:
-		panic("uh oh")
+		d.prev.R = d.tmp[1]
+		d.prev.G = d.tmp[2]
+		d.prev.B = d.tmp[3]
+	case t == opRGBA:
+		_, err := io.ReadFull(d.r, d.tmp[1:5])
+		if err != nil {
+			return err
+		}
+		d.prev.R = d.tmp[1]
+		d.prev.G = d.tmp[2]
+		d.prev.B = d.tmp[3]
+		d.prev.A = d.tmp[4]
+	case t&opMask2 == opIndex:
+		d.prev = d.index[t]
+	case t&opMask2 == opDiff:
+		d.prev.R += t>>4&0x3 - 2
+		d.prev.G += t>>2&0x3 - 2
+		d.prev.B += t&0x3 - 2
+	case t&opMask2 == opLuma:
+		_, err := io.ReadFull(d.r, d.tmp[1:2])
+		if err != nil {
+			return err
+		}
+		delta := t&^opMask2 - 32
+		d.prev.R += delta - 8 + d.tmp[1]>>4&0xf
+		d.prev.G += delta
+		d.prev.B += delta - 8 + d.tmp[1]&0xf
+	case t&opMask2 == opRun:
+		d.run = int(t &^ opMask2)
 	}
+
+	d.index[hash(d.prev)%64] = d.prev
 
 	return nil
 }
 
 // DecodeConfig returns the color model and dimensions of a QOI image without
 // decoding the entire image. The color model is always color.NRGBAModel,
-// regardless of the QOI header's "channels" value.
+// regardless of QOI header metadata.
 func DecodeConfig(r io.Reader) (image.Config, error) {
 	d := &decoder{r: r}
 
@@ -135,9 +164,12 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 }
 
 // Decode reads a QOI image from r and returns it as an image.Image. The type of
-// Image returned depends on the QOI contents.
+// Image returned is always image.NRGBA, regardless of QOI header metadata.
 func Decode(r io.Reader) (image.Image, error) {
-	d := &decoder{r: r}
+	d := &decoder{
+		r:    r,
+		prev: color.NRGBA{A: 255},
+	}
 
 	if err := d.parseHeader(); err != nil {
 		if err == io.EOF {
@@ -146,12 +178,22 @@ func Decode(r io.Reader) (image.Image, error) {
 		return nil, err
 	}
 
-	for d.stage != dsSeenEndMarker {
-		if err := d.parseChunk(); err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
+	var (
+		minY = d.img.Bounds().Min.Y
+		maxY = d.img.Bounds().Max.Y
+		minX = d.img.Bounds().Min.X
+		maxX = d.img.Bounds().Max.X
+	)
+
+	for y := minY; y < maxY; y++ {
+		for x := minX; x < maxX; x++ {
+			if err := d.advance(); err != nil {
+				if err == io.EOF {
+					err = io.ErrUnexpectedEOF
+				}
+				return nil, err
 			}
-			return nil, err
+			d.img.SetNRGBA(x, y, d.prev)
 		}
 	}
 

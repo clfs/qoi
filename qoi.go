@@ -4,7 +4,6 @@
 package qoi
 
 import (
-	"bytes"
 	"encoding/binary"
 	"image"
 	"image/color"
@@ -14,10 +13,10 @@ import (
 // headerLen is the length of a QOI header.
 const headerLen = 14
 
-// magic is the magic signature for the QOI format.
+// magic is the QOI format magic signature.
 const magic = "qoif"
 
-// endMarker is the QOI EOF marker.
+// endMarker is the QOI end-of-stream marker.
 const endMarker = "\x00\x00\x00\x00\x00\x00\x00\x01"
 
 // Start-of-chunk tag.
@@ -30,6 +29,10 @@ const (
 	tagRun   = 0b11
 )
 
+func hash(r, g, b, a uint8) uint8 {
+	return (r*3 + g*5 + b*7 + a*11) % 64
+}
+
 // A FormatError reports that the input is not a valid QOI image.
 type FormatError string
 
@@ -37,28 +40,77 @@ func (e FormatError) Error() string {
 	return "qoi: invalid format: " + string(e)
 }
 
-func hash(r, g, b, a uint8) uint8 {
-	return (r*3 + g*5 + b*7 + a*11) % 64
-}
+var chunkOrderError = FormatError("chunk out of order")
 
 // Decoding stage.
 const (
-	dsHeader = iota
-	dsChunks
-	dsEndMarker
+	dsStart = iota
+	dsSeenHeader
+	dsSeenRGB
+	dsSeenRGBA
+	dsSeenIndex
+	dsSeenDiff
+	dsSeenLuma
+	dsSeenRun
+	dsSeenEndMarker
 )
 
 type decoder struct {
-	r     io.Reader
-	img   image.Image
-	stage int
+	r             io.Reader
+	img           image.Image
+	width, height int
+	stage         int
+	tmp           [1024]byte
 }
 
-func (d *decoder) checkHeader() error {
+func (d *decoder) parseHeader() error {
+	_, err := io.ReadFull(d.r, d.tmp[:len(magic)])
+	if err != nil {
+		return err
+	}
+
+	if string(d.tmp[:len(magic)]) != magic {
+		return FormatError("not a QOI file")
+	}
+
+	_, err = io.ReadFull(d.r, d.tmp[:headerLen-len(magic)])
+	if err != nil {
+		return err
+	}
+
+	// TODO: Dimension overflow checks.
+
+	d.width = int(binary.BigEndian.Uint32(d.tmp[0:4]))
+	d.height = int(binary.BigEndian.Uint32(d.tmp[4:8]))
+
 	return nil
 }
 
 func (d *decoder) parseChunk() error {
+	if _, err := io.ReadFull(d.r, d.tmp[:1]); err != nil {
+		return err
+	}
+
+	switch t := d.tmp[0]; {
+	case t == tagRGB:
+		if d.stage != dsStart {
+			return chunkOrderError
+		}
+		d.stage = dsSeenRGB
+	case t == tagRGBA:
+		return nil
+	case t>>6 == tagIndex:
+		return nil
+	case t>>6 == tagDiff:
+		return nil
+	case t>>6 == tagLuma:
+		return nil
+	case t>>6 == tagRun:
+		return nil
+	default:
+		panic("uh oh")
+	}
+
 	return nil
 }
 
@@ -66,24 +118,20 @@ func (d *decoder) parseChunk() error {
 // decoding the entire image. The color model is always color.NRGBAModel,
 // regardless of the QOI header's "channels" value.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	header := make([]byte, headerLen)
-	if _, err := io.ReadFull(r, header); err != nil {
+	d := &decoder{r: r}
+
+	if err := d.parseHeader(); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return image.Config{}, err
 	}
 
-	if !bytes.Equal(header[0:4], []byte(magic)) {
-		return image.Config{}, FormatError("bad magic")
-	}
-
-	// TODO: Dimension overflow checks.
-
-	config := image.Config{
+	return image.Config{
 		ColorModel: color.NRGBAModel,
-		Width:      int(binary.BigEndian.Uint32(header[4:8])),
-		Height:     int(binary.BigEndian.Uint32(header[8:12])),
-	}
-
-	return config, nil
+		Width:      d.width,
+		Height:     d.height,
+	}, nil
 }
 
 // Decode reads a QOI image from r and returns it as an image.Image. The type of
@@ -91,14 +139,14 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 func Decode(r io.Reader) (image.Image, error) {
 	d := &decoder{r: r}
 
-	if err := d.checkHeader(); err != nil {
+	if err := d.parseHeader(); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
 		return nil, err
 	}
 
-	for d.stage != dsEndMarker {
+	for d.stage != dsSeenEndMarker {
 		if err := d.parseChunk(); err != nil {
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF

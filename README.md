@@ -1,2 +1,2 @@
 # qoi
-A QOI image encoder and decoder.
+A QOI image decoder and encoder.

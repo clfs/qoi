@@ -10,6 +10,26 @@ import (
 	"io"
 )
 
+func init() {
+	image.RegisterFormat("qoi", magic, Decode, DecodeConfig)
+}
+
+// ColorSpace is the color space of an image.
+type ColorSpace int
+
+const (
+	SRGBLinearAlpha ColorSpace = 0
+	AllLinear       ColorSpace = 1
+)
+
+// Channels represents the number of channels in an image.
+type Channels int
+
+const (
+	RGB  Channels = 3
+	RGBA Channels = 4
+)
+
 // Start-of-chunk tag constant.
 const (
 	opIndex = 0b0000_0000
@@ -23,10 +43,6 @@ const (
 	opMask2 = 0b1100_0000
 )
 
-func hash(c color.NRGBA) uint8 {
-	return c.R*3 + c.G*5 + c.B*7 + c.A*11
-}
-
 const magic = "qoif"
 
 const headerLen = 14
@@ -39,6 +55,10 @@ type FormatError string
 
 func (e FormatError) Error() string {
 	return "qoi: invalid format: " + string(e)
+}
+
+func hash(c color.NRGBA) uint8 {
+	return c.R*3 + c.G*5 + c.B*7 + c.A*11
 }
 
 type decoder struct {
@@ -73,15 +93,15 @@ func (d *decoder) parseHeader() error {
 
 	d.img = image.NewNRGBA(image.Rect(0, 0, d.width, d.height))
 
-	switch channels := d.tmp[8]; channels {
-	case 3, 4: // RGB, RGBA
+	switch c := Channels(d.tmp[8]); c {
+	case RGB, RGBA:
 		// ok
 	default:
 		return FormatError("invalid channel count")
 	}
 
-	switch colorSpace := d.tmp[9]; colorSpace {
-	case 0, 1: // sRGB, linear
+	switch c := ColorSpace(d.tmp[9]); c {
+	case SRGBLinearAlpha, AllLinear:
 		// ok
 	default:
 		return FormatError("invalid color space")
@@ -205,3 +225,31 @@ func Decode(r io.Reader) (image.Image, error) {
 func Encode(w io.Writer, m image.Image) error {
 	return nil
 }
+
+type encoder struct {
+}
+
+// Encoder configures encoding QOI images.
+type Encoder struct {
+	Channels   Channels
+	ColorSpace ColorSpace
+
+	// BufferPool optionally specifies a buffer pool to get temporary
+	// EncoderBuffers when encoding an image.
+	BufferPool EncoderBufferPool
+}
+
+func (enc *Encoder) Encode(w io.Writer, m image.Image) error {
+	return nil
+}
+
+// EncoderBufferPool is an interface for getting and returning temporary
+// instances of the EncoderBuffer struct. This can be used to reuse buffers when
+// encoding multiple images.
+type EncoderBufferPool interface {
+	Get() *EncoderBuffer
+	Put(*EncoderBuffer)
+}
+
+// EncoderBuffer holds the buffers used for encoding QOI images.
+type EncoderBuffer encoder

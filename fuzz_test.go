@@ -26,10 +26,10 @@ func FuzzDecode(f *testing.F) {
 			ch Channels
 			co ColorSpace
 		}{
-			{RGBA, SRGBLinearAlpha},
-			{RGBA, AllLinear},
-			{RGB, SRGBLinearAlpha},
-			{RGB, AllLinear},
+			{RGB, SRGB},
+			{RGB, Linear},
+			{RGBA, SRGB},
+			{RGBA, Linear},
 		}
 
 		for _, opt := range opts {

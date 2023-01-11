@@ -5,6 +5,7 @@ package qoi
 
 import (
 	"encoding/binary"
+	"fmt"
 	"image"
 	"image/color"
 	"io"
@@ -18,17 +19,30 @@ func init() {
 type ColorSpace int
 
 const (
-	SRGBLinearAlpha ColorSpace = 0
-	AllLinear       ColorSpace = 1
+	SRGB   ColorSpace = iota // sRGB with linear alpha
+	Linear                   // all channels linear
 )
 
-// Channels represents the number of channels in an image.
+// Channels represents channels present in an image.
 type Channels int
 
 const (
-	RGB  Channels = 3
-	RGBA Channels = 4
+	RGB Channels = iota
+	RGBA
 )
+
+// This function is required because we want the zero value of
+// Encoder.Channels to map to an actual channel count.
+func channelsToCount(c Channels) int {
+	switch c {
+	case RGB:
+		return 3
+	case RGBA:
+		return 4
+	default:
+		return 4
+	}
+}
 
 // Start-of-chunk tag constant.
 const (
@@ -93,15 +107,15 @@ func (d *decoder) parseHeader() error {
 
 	d.img = image.NewNRGBA(image.Rect(0, 0, d.width, d.height))
 
-	switch c := Channels(d.tmp[8]); c {
-	case RGB, RGBA:
+	switch d.tmp[8] {
+	case 3, 4: // RGB, RGBA
 		// ok
 	default:
 		return FormatError("invalid channel count")
 	}
 
-	switch c := ColorSpace(d.tmp[9]); c {
-	case SRGBLinearAlpha, AllLinear:
+	switch d.tmp[9] {
+	case 0, 1: // SRGBLinearAlpha, AllLinear
 		// ok
 	default:
 		return FormatError("invalid color space")
@@ -223,10 +237,68 @@ func Decode(r io.Reader) (image.Image, error) {
 // Encode writes the Image m to w in QOI format. Any Image may be encoded, but
 // images that are not image.NRGBA might be encoded lossily.
 func Encode(w io.Writer, m image.Image) error {
-	return nil
+	var e Encoder
+	return e.Encode(w, m)
 }
 
 type encoder struct {
+	enc   *Encoder
+	w     io.Writer
+	m     image.Image
+	err   error
+	tmp   [100]byte
+	cr    [][]uint8
+	index [64]color.NRGBA
+	prev  color.NRGBA
+	run   int
+}
+
+func (e *encoder) writeHeader() {
+	copy(e.tmp[:4], magic)
+
+	b := e.m.Bounds()
+	binary.BigEndian.PutUint32(e.tmp[4:8], uint32(b.Dx()))
+	binary.BigEndian.PutUint32(e.tmp[8:12], uint32(b.Dy()))
+
+	e.tmp[12] = byte(e.enc.Channels + 3) // RGB -> 3, RGBA -> 4
+	e.tmp[13] = byte(e.enc.ColorSpace)
+
+	e.err = binary.Write(e.w, binary.BigEndian, e.tmp[:14])
+}
+
+func (e *encoder) writeChunks() {
+	if e.err != nil {
+		return
+	}
+
+	b := e.m.Bounds()
+
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			c := color.NRGBAModel.Convert(e.m.At(x, y)).(color.NRGBA)
+
+			if c == e.prev {
+				e.run++
+				if e.run == 62 || (x == b.Max.X-1 && y == b.Max.Y-1) {
+					e.err = binary.Write(e.w, binary.BigEndian, []byte{opRun | byte(e.run)})
+					e.run = 0
+				}
+			}
+		}
+	}
+
+}
+
+func (e *encoder) advance() {
+
+}
+
+func (e *encoder) writeEndMarker() {
+	if e.err != nil {
+		return
+	}
+
+	e.err = binary.Write(e.w, binary.BigEndian, []byte(endMarker))
 }
 
 // Encoder configures encoding QOI images.
@@ -240,7 +312,33 @@ type Encoder struct {
 }
 
 func (enc *Encoder) Encode(w io.Writer, m image.Image) error {
-	return nil
+	mw, mh := int64(m.Bounds().Dx()), int64(m.Bounds().Dy())
+	if mw <= 0 || mh <= 0 || mw >= 1<<32 || mh >= 1<<32 {
+		return FormatError(fmt.Sprintf("invalid image size: %dx%d", mw, mh))
+	}
+
+	var e *encoder
+	if enc.BufferPool != nil {
+		buffer := enc.BufferPool.Get()
+		e = (*encoder)(buffer)
+	}
+	if e == nil {
+		e = &encoder{}
+	}
+	if enc.BufferPool != nil {
+		defer enc.BufferPool.Put((*EncoderBuffer)(e))
+	}
+
+	e.enc = enc
+	e.w = w
+	e.m = m
+	e.prev = color.NRGBA{A: 255}
+
+	e.writeHeader()
+	e.writeChunks()
+	e.writeEndMarker()
+
+	return e.err
 }
 
 // EncoderBufferPool is an interface for getting and returning temporary
